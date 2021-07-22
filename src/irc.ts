@@ -172,7 +172,7 @@ export class Client extends EventEmitter {
     private opt: IrcClientOptInternal;
     private hostMask = '';
     private prevClashNick = '';
-    private maxLineLength = 0;
+    private _maxLineLength = 0;
     public conn?: Socket|tls.TLSSocket;
     private requestedDisconnect = false;
     private supportedState: IrcSupported;
@@ -205,6 +205,10 @@ export class Client extends EventEmitter {
         return {
             ...this.supportedState,
         };
+    }
+
+    get maxLineLength(): number {
+        return this._maxLineLength;
     }
 
     /**
@@ -1600,7 +1604,7 @@ export class Client extends EventEmitter {
     private _updateMaxLineLength(): void {
         // 497 = 510 - (":" + "!" + " PRIVMSG " + " :").length;
         // target is determined in _speak() and subtracted there
-        this.maxLineLength = 497 - this.nick.length - this.hostMask.length;
+        this._maxLineLength = 497 - this.nick.length - this.hostMask.length;
     }
 
     // Checks the arg at the given index for a channel. If one exists, casemap it
