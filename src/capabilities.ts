@@ -1,29 +1,41 @@
 import { Message } from "./parse_message";
 
-interface CapabilitiesSet {
-    caps: Set<string>;
-    saslTypes?: Set<string>;
+class Capabilities {
+    constructor(
+        public caps = new Set<string>(),
+        public saslTypes = new Set<string>(),
+        public ready = false,
+    ) {}
+
+    extend(messageArgs: string[]) {
+        let capabilityString = messageArgs[0];
+        // https://ircv3.net/specs/extensions/capability-negotiation.html#multiline-replies-to-cap-ls-and-cap-list
+        if (capabilityString === '*') {
+            capabilityString = messageArgs[1];
+        }
+        else {
+            this.ready = true;
+        }
+        const allCaps = capabilityString.trim().split(' ');
+        // Not all servers respond with the type of sasl supported.
+        const saslTypes = allCaps.find((s) => s.startsWith('sasl='))?.split('=')[1]
+            .split(',')
+            .map((s) => s.toUpperCase()) || [];
+        if (saslTypes) {
+            allCaps.push('sasl');
+        }
+
+        allCaps.forEach(c => this.caps.add(c));
+        saslTypes.forEach(t => this.saslTypes.add(t));
+    }
 }
 
 /**
  * A helper class to handle capabilities sent by the IRCd.
  */
 export class IrcCapabilities {
-
-    static parseCapabilityString(caps: string): CapabilitiesSet {
-        const allCaps = caps.trim().split(' ');
-        // Not all servers respond with the type of sasl supported.
-        const saslTypes = allCaps.find((s) => s.startsWith('sasl='))?.split('=')[1]
-            .split(',')
-            .map((s) => s.toUpperCase());
-        if (saslTypes) {
-            allCaps.push('sasl');
-        }
-        return {
-            caps: new Set(allCaps),
-            saslTypes: new Set(saslTypes),
-        }
-    }
+    private serverCapabilites = new Capabilities();
+    private userCapabilites = new Capabilities();
 
     constructor(
         private readonly onCapsList: () => void,
@@ -32,11 +44,11 @@ export class IrcCapabilities {
     }
 
     public get capsReady() {
-        return !!this.userCapabilites;
+        return this.userCapabilites.ready;
     }
 
     public get supportsSasl() {
-        if (!this.serverCapabilites) {
+        if (!this.serverCapabilites.ready) {
             throw Error('Server response has not arrived yet');
         }
         return this.serverCapabilites.caps.has('sasl');
@@ -51,20 +63,17 @@ export class IrcCapabilities {
      * @throws If the capabilites have not returned yet.
      */
     public supportsSaslMethod(method: string, allowNoMethods=false) {
-        if (!this.serverCapabilites) {
+        if (!this.serverCapabilites.ready) {
             throw Error('Server caps response has not arrived yet');
         }
         if (!this.serverCapabilites.caps.has('sasl')) {
             return false;
         }
-        if (!this.serverCapabilites.saslTypes) {
+        if (this.serverCapabilites.saslTypes.size === 0) {
             return allowNoMethods;
         }
         return this.serverCapabilites.saslTypes.has(method.toUpperCase());
     }
-
-    private serverCapabilites?: CapabilitiesSet;
-    private userCapabilites?: CapabilitiesSet;
 
     /**
      * Handle an incoming `CAP` message.
@@ -73,18 +82,22 @@ export class IrcCapabilities {
         // E.g. CAP * LS :account-notify away-notify chghost extended-join multi-prefix
         // sasl=PLAIN,ECDSA-NIST256P-CHALLENGE,EXTERNAL tls account-tag cap-notify echo-message
         // solanum.chat/identify-msg solanum.chat/realhost
-        const [, subCmd, parts] = message.args;
+        const [, subCmd, ...parts] = message.args;
         if (subCmd === 'LS') {
-            // Listing all caps
-            this.serverCapabilites = IrcCapabilities.parseCapabilityString(parts);
-            // We now need to request
-            this.onCapsList();
+            this.serverCapabilites.extend(parts);
+
+            if (this.serverCapabilites.ready) {
+                // We now need to request user caps
+                this.onCapsList();
+            }
         }
         // The target might be * or the nickname, for now just accept either.
         if (subCmd === 'ACK') {
-            // Listing all caps
-            this.userCapabilites = IrcCapabilities.parseCapabilityString(parts);
-            this.onCapsConfirmed();
+            this.userCapabilites.extend(parts);
+
+            if (this.userCapabilites.ready) {
+                this.onCapsConfirmed();
+            }
         }
     }
 }
