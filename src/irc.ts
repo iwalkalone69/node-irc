@@ -18,7 +18,7 @@
     along with this library.  If not, see <http://www.gnu.org/licenses/>.
 */
 import * as dns from 'dns';
-import { Socket, createConnection, TcpNetConnectOpts } from 'net';
+import { Socket, createConnection, TcpNetConnectOpts, TcpSocketConnectOpts } from 'net';
 import * as tls from 'tls';
 import * as util from 'util';
 import isValidUTF8 from 'utf-8-validate';
@@ -1204,6 +1204,23 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         this.emit('connect');
     }
 
+    protected async createSecureConnection(opts: tls.ConnectionOptions): Promise<tls.TLSSocket> {
+        return new Promise((resolve) => {
+            const socket = tls.connect(opts, () => {
+                resolve(socket);
+            });
+        });
+    }
+
+    protected createConnection(opts: TcpSocketConnectOpts): Promise<Socket> {
+        return new Promise((resolve) => {
+            let socket: tls.TLSSocket;
+            createConnection(opts, () => {
+                resolve(socket);
+            });
+        });
+    }
+
     public connect(retryCountOrCallBack?: number|(() => void), callback?: () => void) {
         let retryCount: number;
         if (typeof retryCountOrCallBack === 'function') {
@@ -1271,6 +1288,8 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
         // destroy old socket before allocating a new one
         if (this.conn) {this.conn.destroy();}
 
+        let newConnectionPromise: Promise<Socket>;
+
         // try to connect to the server
         if (this.opt.secure) {
             let secureOpts: tls.ConnectionOptions = {
@@ -1285,105 +1304,101 @@ export class Client extends (EventEmitter as unknown as new () => TypedEmitter<C
                     ...this.opt.secure,
                 };
             }
-
-            this.conn = tls.connect(secureOpts, () => {
-                if (this.conn === undefined) {
-                    throw Error('Conn was not defined');
-                }
-                if (!(this.conn instanceof tls.TLSSocket)) {
-                    throw Error('Conn was not a TLSSocket');
-                }
-
+            newConnectionPromise = this.createSecureConnection(secureOpts).then((secureConn) => {
                 // callback called only after successful socket connection
-
-                if (!this.conn.authorized) {
-                    switch (this.conn.authorizationError.toString()) {
+                if (!secureConn.authorized) {
+                    switch (secureConn.authorizationError.toString()) {
                         case 'DEPTH_ZERO_SELF_SIGNED_CERT':
                         case 'UNABLE_TO_VERIFY_LEAF_SIGNATURE':
                         case 'SELF_SIGNED_CERT_IN_CHAIN':
                             if (!this.opt.selfSigned) {
-                                return this.conn.destroy(this.conn.authorizationError);
+                                return secureConn.destroy(secureConn.authorizationError);
                             }
                             break;
                         case 'CERT_HAS_EXPIRED':
                             if (!this.opt.certExpired) {
-                                return this.conn.destroy(this.conn.authorizationError);
+                                return secureConn.destroy(secureConn.authorizationError);
                             }
                             break;
                         default:
                             // Fail on other errors
-                            return this.conn.destroy(this.conn.authorizationError)
+                            return secureConn.destroy(secureConn.authorizationError)
                     }
                 }
-                if (!this.opt.encoding) {
-                    this.conn.setEncoding('utf-8');
-                }
-                this._connectionHandler();
-            });
+                return secureConn;
+            })
         }
         else {
-            this.conn = createConnection(connectionOpts, this._connectionHandler.bind(this));
+            newConnectionPromise = this.createConnection(connectionOpts);
         }
 
-        this.requestedDisconnect = false;
-        this.conn.setTimeout(1000 * 180);
+        newConnectionPromise.then((newConn) => {
+            this.conn = newConn;
 
-        let buffer = Buffer.alloc(0);
-
-        this.conn.addListener('data', (chunk: string|Buffer) => {
-            if (typeof chunk === 'string') {
-                chunk = Buffer.from(chunk);
+            if (!this.opt.encoding) {
+                this.conn.setEncoding('utf-8');
             }
-            buffer = Buffer.concat([buffer, chunk]);
+            this._connectionHandler();
 
-            const lines = this.convertEncoding(buffer).toString().split(lineDelimiter);
+            this.requestedDisconnect = false;
+            this.conn.setTimeout(1000 * 180);
 
-            if (lines.pop()) {
-                // if buffer is not ended with \r\n, there's more chunks.
-                return;
-            }
-            // else, initialize the buffer.
-            buffer = Buffer.alloc(0);
+            let buffer = Buffer.alloc(0);
 
+            this.conn.addListener('data', (chunk: string|Buffer) => {
+                if (typeof chunk === 'string') {
+                    chunk = Buffer.from(chunk);
+                }
+                buffer = Buffer.concat([buffer, chunk]);
 
-            lines.forEach((line) => {
-                if (!line.length) {
+                const lines = this.convertEncoding(buffer).toString().split(lineDelimiter);
+
+                if (lines.pop()) {
+                    // if buffer is not ended with \r\n, there's more chunks.
                     return;
                 }
-                const message = parseMessage(line, this.opt.stripColors);
-                try {
-                    this.emit('raw', message);
-                }
-                catch (err) {
-                    if (!this.requestedDisconnect) {
-                        throw err;
+                // else, initialize the buffer.
+                buffer = Buffer.alloc(0);
+
+                lines.forEach((line) => {
+                    if (!line.length) {
+                        return;
                     }
+                    const message = parseMessage(line, this.opt.stripColors);
+                    try {
+                        this.emit('raw', message);
+                    }
+                    catch (err) {
+                        if (!this.requestedDisconnect) {
+                            throw err;
+                        }
+                    }
+                });
+            });
+            this.conn.addListener('end', () => {
+                if (this.opt.debug) {
+                    util.log('Connection got "end" event');
                 }
             });
-        });
-        this.conn.addListener('end', () => {
-            if (this.opt.debug) {
-                util.log('Connection got "end" event');
-            }
-        });
-        this.conn.addListener('close', () => {
-            if (this.opt.debug) {
-                util.log('Connection got "close" event');
-            }
-            this.reconnect(retryCount);
-        });
-        this.conn.addListener('timeout', () => {
-            if (this.opt.debug) {
-                util.log('Connection got "timeout" event');
-            }
-            this.reconnect(retryCount);
-        });
-        this.conn.addListener('error', (exception) => {
-            if (this.opt.debug) {
-                util.log('Network error: ' + exception);
-            }
-            this.emit('netError', exception);
-        });
+            this.conn.addListener('close', () => {
+                if (this.opt.debug) {
+                    util.log('Connection got "close" event');
+                }
+                this.reconnect(retryCount);
+            });
+            this.conn.addListener('timeout', () => {
+                if (this.opt.debug) {
+                    util.log('Connection got "timeout" event');
+                }
+                this.reconnect(retryCount);
+            });
+            this.conn.addListener('error', (exception) => {
+                if (this.opt.debug) {
+                    util.log('Network error: ' + exception);
+                }
+                this.emit('netError', exception);
+            });
+        })
     }
 
     private reconnect(retryCount: number) {
